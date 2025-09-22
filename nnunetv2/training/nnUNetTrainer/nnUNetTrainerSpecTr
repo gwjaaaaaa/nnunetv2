@@ -1,1 +1,145 @@
+# nnunetv2/training/nnUNetTrainer/variants/nnUNetTrainerSpecTr.py
+"""
+SpecTr 论文复现版 trainer
+- Adam + lr=3e-4 + 75 epoch
+- 纯 Dice 损失（weight_ce=0）
+- 仅旋转+翻转（关闭色彩/噪声/弹性）
+"""
+from __future__ import annotations
+import numpy as np
+import torch
+from batchgeneratorsv2.transforms.base.basic_transform import BasicTransform
+from batchgeneratorsv2.transforms.spatial.mirroring import MirrorTransform
+from batchgeneratorsv2.transforms.spatial.spatial import SpatialTransform
+from batchgeneratorsv2.transforms.utils.compose import ComposeTransforms
+from batchgeneratorsv2.helpers.scalar_type import RandomScalar
+from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler
+from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+from nnunetv2.training.loss.compound_losses import DC_and_CE_loss
+from nnunetv2.training.loss.dice import MemoryEfficientSoftDiceLoss
 
+
+class nnUNetTrainerSpecTr(nnUNetTrainer):
+    """
+    复现 SpecTr 论文训练设置：
+    1. Adam, lr=3e-4, 75 epoch
+    2. 纯 Dice 损失（weight_ce=0）
+    3. 数据增强仅旋转+翻转（无弹性/色彩/噪声）
+    """
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, device=torch.device('cuda')):
+        # 1. 先调用父类初始化
+        super().__init__(plans, configuration, fold, dataset_json, device)
+
+        # 2. 覆盖超参
+        self.initial_lr = 3e-4
+        self.num_epochs = 75
+        self.weight_decay = 3e-5          # 论文未提，保持 nnUNet 默认
+        self.save_every = 1000            # 只存 final
+        # 其余（batch_size=1, Dice loss, cosine 退火）已由父类或后续方法保证
+
+    # ---------- 优化器 ----------
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.network.parameters(),
+                                     lr=self.initial_lr,
+                                     weight_decay=self.weight_decay)
+        lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
+        return optimizer, lr_scheduler
+
+    # ---------- 损失：纯 Dice ----------
+    def _build_loss(self):
+        # 关闭 CE 权重 → weight_ce=0
+        loss = DC_and_CE_loss({'batch_dice': self.configuration_manager.batch_dice,
+                               'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp},
+                              {}, weight_ce=0, weight_dice=1,
+                              ignore_label=self.label_manager.ignore_label,
+                              dice_class=MemoryEfficientSoftDiceLoss)
+        if self.enable_deep_supervision:
+            # 深度监督权重同父类
+            deep_supervision_scales = self._get_deep_supervision_scales()
+            weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
+            weights[-1] = 0
+            weights = weights / weights.sum()
+            from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
+            loss = DeepSupervisionWrapper(loss, weights)
+        return loss
+
+    # ---------- 数据增强：仅旋转+翻转 ----------
+    @staticmethod
+    def get_training_transforms(patch_size: tuple,
+                                rotation_for_DA: RandomScalar,
+                                deep_supervision_scales,
+                                mirror_axes: tuple,
+                                do_dummy_2d_data_aug: bool,
+                                use_mask_for_norm,
+                                is_cascaded: bool = False,
+                                foreground_labels=None,
+                                regions=None,
+                                ignore_label=None) -> BasicTransform:
+        transforms = []
+        if do_dummy_2d_data_aug:
+            from batchgeneratorsv2.transforms.utils.pseudo2d import Convert3DTo2DTransform, Convert2DTo3DTransform
+            transforms.append(Convert3DTo2DTransform())
+            patch_size_spatial = patch_size[1:]
+            ignore_axes = (0,)
+        else:
+            patch_size_spatial = patch_size
+            ignore_axes = None
+
+        # 仅旋转 + 缩放关闭
+        transforms.append(
+            SpatialTransform(
+                patch_size_spatial,
+                patch_center_dist_from_border=0,
+                random_crop=False,
+                p_elastic_deform=0,      # 关闭弹性
+                p_rotation=0.2,
+                rotation=rotation_for_DA,
+                p_scaling=0,             # 关闭缩放
+                p_synchronize_scaling_across_axes=1,
+                bg_style_seg_sampling=False
+            )
+        )
+        if do_dummy_2d_data_aug:
+            transforms.append(Convert2DTo3DTransform())
+
+        # 关闭所有非几何增强（概率设 0）
+        # 只保留镜像
+        if mirror_axes is not None and len(mirror_axes) > 0:
+            transforms.append(MirrorTransform(allowed_axes=mirror_axes))
+
+        # 通用收尾
+        from batchgeneratorsv2.transforms.utils.remove_label import RemoveLabelTansform
+        transforms.append(RemoveLabelTansform(-1, 0))
+        if is_cascaded:
+            # cascade 相关 transform 保持默认
+            from batchgeneratorsv2.transforms.nnunet.seg_to_onehot import MoveSegAsOneHotToDataTransform
+            from batchgeneratorsv2.transforms.nnunet.random_binary_operator import ApplyRandomBinaryOperatorTransform
+            from batchgeneratorsv2.transforms.nnunet.remove_connected_components import RemoveRandomConnectedComponentFromOneHotEncodingTransform
+            transforms.append(MoveSegAsOneHotToDataTransform(source_channel_idx=1,
+                                                             all_labels=foreground_labels,
+                                                             remove_channel_from_source=True))
+            transforms.append(ApplyRandomBinaryOperatorTransform(channel_idx=list(range(-len(foreground_labels), 0)),
+                                                                strel_size=(1, 8), p_per_label=1))
+            transforms.append(RemoveRandomConnectedComponentFromOneHotEncodingTransform(
+                channel_idx=list(range(-len(foreground_labels), 0)),
+                fill_with_other_class_p=0,
+                dont_do_if_covers_more_than_x_percent=0.15,
+                p_per_label=1))
+
+        if regions is not None:
+            from batchgeneratorsv2.transforms.utils.seg_to_regions import ConvertSegmentationToRegionsTransform
+            transforms.append(ConvertSegmentationToRegionsTransform(regions=list(regions) + [ignore_label]
+                                                                   if ignore_label is not None else regions,
+                                                                   channel_in_seg=0))
+        if deep_supervision_scales is not None:
+            from batchgeneratorsv2.transforms.utils.deep_supervision_downsampling import DownsampleSegForDSTransform
+            transforms.append(DownsampleSegForDSTransform(ds_scales=deep_supervision_scales))
+
+        return ComposeTransforms(transforms)
+
+    # 验证 transform 保持父类不变
+    @staticmethod
+    def get_validation_transforms(deep_supervision_scales, is_cascaded=False,
+                                 foreground_labels=None, regions=None, ignore_label=None):
+        return nnUNetTrainer.get_validation_transforms(deep_supervision_scales, is_cascaded,
+                                                      foreground_labels, regions, ignore_label)
