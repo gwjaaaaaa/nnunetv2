@@ -5,6 +5,7 @@ SpecTr 论文复现版 trainer
 - 纯 Dice 损失（weight_ce=0）
 - 仅旋转+翻转（关闭色彩/噪声/弹性）
 """
+
 from __future__ import annotations
 import numpy as np
 import torch
@@ -18,14 +19,16 @@ from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.training.loss.compound_losses import DC_and_CE_loss
 from nnunetv2.training.loss.dice import MemoryEfficientSoftDiceLoss
 
-
+# 继承官方的nnUNetTrainer，只重写差异部分
 class nnUNetTrainerSpecTr(nnUNetTrainer):
+
     """
     复现 SpecTr 论文训练设置：
     1. Adam, lr=3e-4, 75 epoch
     2. 纯 Dice 损失（weight_ce=0）
     3. 数据增强仅旋转+翻转（无弹性/色彩/噪声）
     """
+
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, device=torch.device('cuda')):
         # 1. 先调用父类初始化
         super().__init__(plans, configuration, fold, dataset_json, device)
@@ -34,9 +37,10 @@ class nnUNetTrainerSpecTr(nnUNetTrainer):
         self.initial_lr = 3e-4
         self.num_epochs = 75
         self.weight_decay = 3e-5          # 论文未提，保持 nnUNet 默认
-        self.save_every = 1000            # 只存 final
+        self.save_every = 1000            # >75 → 中间不存 ckpt，只留 final（论文只报告最后一轮）
         # 其余（batch_size=1, Dice loss, cosine 退火）已由父类或后续方法保证
 
+    # 父类默认SGD+momentum，这里换为论文中指定的Adam优化器
     # ---------- 优化器 ----------
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.network.parameters(),
@@ -45,6 +49,7 @@ class nnUNetTrainerSpecTr(nnUNetTrainer):
         lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
         return optimizer, lr_scheduler
 
+    # 官方为Dice+CrossEntropy混合，论文只留Dice
     # ---------- 损失：纯 Dice ----------
     def _build_loss(self):
         # 关闭 CE 权重 → weight_ce=0
@@ -136,8 +141,9 @@ class nnUNetTrainerSpecTr(nnUNetTrainer):
             transforms.append(DownsampleSegForDSTransform(ds_scales=deep_supervision_scales))
 
         return ComposeTransforms(transforms)
-
-    # 验证 transform 保持父类不变
+    
+    # 完全不调父类，直接返回官方默认验证变换（只做重采样+去ignore label）
+    # 验证 transform 保持父类不变（这里的transform只是数据预处理/增强模块）
     @staticmethod
     def get_validation_transforms(deep_supervision_scales, is_cascaded=False,
                                  foreground_labels=None, regions=None, ignore_label=None):
